@@ -1,0 +1,97 @@
+name: vfy-bf45-arms
+on:
+  workflow_dispatch:
+    inputs:
+      listener: { required: true }
+      s1: { required: true }
+      s2: { required: true }
+      s3: { required: true }
+      s4: { required: true }
+      s5: { required: true }
+permissions: { contents: read, pages: write, id-token: write }
+jobs:
+  arms:
+    runs-on: ubuntu-latest
+    environment: { name: github-pages }
+    steps:
+      - name: build artifacts
+        run: |
+          set -eu
+          mkdir -p site && echo '<html>vfy</html>' > site/index.html
+          # WELLFORMED: uncompressed tar named artifact.tar
+          mkdir -p wf && tar -cf wf/artifact.tar -C site .
+          # MALFORMED A: gzipped tar named art.tar.gz  (gzip content + non-canonical name)
+          mkdir -p ma && tar -czf ma/art.tar.gz -C site .
+          # MALFORMED B: gzipped tar named artifact.tar (gzip content, CANONICAL name)
+          mkdir -p mb && tar -czf mb/artifact.tar -C site .
+          # MALFORMED C: same as A, for the http-scheme arm
+          mkdir -p mc && tar -czf mc/art.tar.gz -C site .
+          ls -l wf ma mb mc
+          file wf/artifact.tar ma/art.tar.gz mb/artifact.tar || true
+      - uses: actions/upload-artifact@v4
+        with: { name: WELLFORMED, path: wf/, retention-days: 1 }
+      - uses: actions/upload-artifact@v4
+        with: { name: MALFORMED_A, path: ma/, retention-days: 1 }
+      - uses: actions/upload-artifact@v4
+        with: { name: MALFORMED_B, path: mb/, retention-days: 1 }
+      - uses: actions/upload-artifact@v4
+        with: { name: MALFORMED_C, path: mc/, retention-days: 1 }
+      - name: arms
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LISTENER: ${{ inputs.listener }}
+          S1: ${{ inputs.s1 }}
+          S2: ${{ inputs.s2 }}
+          S3: ${{ inputs.s3 }}
+          S4: ${{ inputs.s4 }}
+          S5: ${{ inputs.s5 }}
+        run: |
+          set -u
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY/pages/deployments"
+          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
+          echo "oidc len=${#TOKEN}"
+
+          # resolve artifact ids for THIS run
+          curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" > arts.json
+          jq -r '.artifacts[] | "\(.name)\t\(.id)\texpired=\(.expired)"' arts.json
+          ID_WF=$(jq -r '.artifacts[]|select(.name=="WELLFORMED")|.id' arts.json)
+          ID_MA=$(jq -r '.artifacts[]|select(.name=="MALFORMED_A")|.id' arts.json)
+          ID_MB=$(jq -r '.artifacts[]|select(.name=="MALFORMED_B")|.id' arts.json)
+          ID_MC=$(jq -r '.artifacts[]|select(.name=="MALFORMED_C")|.id' arts.json)
+          echo "ID_WF=$ID_WF ID_MA=$ID_MA ID_MB=$ID_MB ID_MC=$ID_MC"
+
+          post() {  # $1=label $2=sha $3=url $4=artifact_id(optional)
+            label="$1"; sha="$2"; url="$3"; aid="${4:-}"
+            echo "===== $label ====="
+            if [ -n "$aid" ]; then
+              jq -nc --arg u "$url" --arg s "$sha" --arg t "$TOKEN" --argjson id "$aid" \
+                '{artifact_id:$id,artifact_url:$u,pages_build_version:$s,oidc_token:$t,environment:"github-pages"}' > p.json
+            else
+              jq -nc --arg u "$url" --arg s "$sha" --arg t "$TOKEN" \
+                '{artifact_url:$u,pages_build_version:$s,oidc_token:$t,environment:"github-pages"}' > p.json
+            fi
+            echo "  url=$url artifact_id=${aid:-<none>}"
+            code=$(curl -s -o out.json -w '%{http_code}' -X POST \
+              -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" -d @p.json)
+            echo "  HTTP=$code"
+            echo "  body: $(head -c 400 out.json)"
+            SU=$(jq -r '.status_url // empty' out.json)
+            if [ -n "$SU" ]; then
+              for i in $(seq 1 24); do
+                st=$(curl -s -H "Authorization: token $GH_TOKEN" "$SU" | jq -r '.status // "?"')
+                echo "  t=$((i*5))s status=$st"
+                case "$st" in succeed|deployment_failed|deployment_attempt_error|deployment_content_failed|errored) break;; esac
+                sleep 5
+              done
+            fi
+          }
+
+          BASE="$LISTENER/vfy-bf45/not-a-pipelines-path"
+          post ARM_A_url_only            "$S1" "$BASE?arm=A"
+          post ARM_C_wellformed_positive "$S2" "$BASE?arm=C" "$ID_WF"
+          post ARM_B_malformed_gz_name   "$S3" "$BASE?arm=B" "$ID_MA"
+          post ARM_B2_malformed_gz_canon "$S4" "$BASE?arm=B2" "$ID_MB"
+          HTTPBASE=$(printf '%s' "$LISTENER" | sed 's#^https://#http://#')
+          post ARM_HTTP_plain_scheme     "$S5" "$HTTPBASE/vfy-bf45/not-a-pipelines-path?arm=HTTP" "$ID_MC"
+          echo "ALL ARMS DISPATCHED"
