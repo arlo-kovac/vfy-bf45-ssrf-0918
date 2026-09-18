@@ -1,0 +1,75 @@
+name: vfy-bf45-arms2
+on:
+  workflow_dispatch:
+    inputs:
+      listener: { required: true }
+      id_mb: { required: true }
+      id_mc: { required: true }
+      id_wf: { required: true }
+      s6: { required: true }
+      s7: { required: true }
+      s8: { required: true }
+permissions: { contents: read, pages: write, id-token: write }
+jobs:
+  arms:
+    runs-on: ubuntu-latest
+    environment: { name: github-pages }
+    steps:
+      - name: arms2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LISTENER: ${{ inputs.listener }}
+          ID_MB: ${{ inputs.id_mb }}
+          ID_MC: ${{ inputs.id_mc }}
+          ID_WF: ${{ inputs.id_wf }}
+          S6: ${{ inputs.s6 }}
+          S7: ${{ inputs.s7 }}
+          S8: ${{ inputs.s8 }}
+        run: |
+          set -u
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY/pages/deployments"
+          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
+          echo "oidc len=${#TOKEN}"
+
+          settle() { # $1 = deployment id to cancel if still running
+            [ -z "${1:-}" ] && return 0
+            for i in $(seq 1 12); do
+              st=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                 "https://api.github.com/repos/$GITHUB_REPOSITORY/pages/deployment/status/$1" | jq -r '.status // "?"')
+              echo "  settle t=$((i*5))s status=$st"
+              case "$st" in succeed|deployment_failed|deployment_content_failed|errored|deployment_cancelled) return 0;; esac
+              sleep 5
+            done
+            echo "  cancelling $1"
+            curl -s -o /dev/null -w '  CANCEL=%{http_code}\n' -X POST -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" "$API/$1/cancel"
+            sleep 8
+          }
+
+          post() { # $1=label $2=sha $3=url $4=artifact_id
+            echo "===== $1 ====="
+            jq -nc --arg u "$3" --arg s "$2" --arg t "$TOKEN" --argjson id "$4" \
+              '{artifact_id:$id,artifact_url:$u,pages_build_version:$s,oidc_token:$t,environment:"github-pages"}' > p.json
+            echo "  url=$3 artifact_id=$4"
+            code=$(curl -s -o out.json -w '%{http_code}' -X POST \
+              -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" -d @p.json)
+            echo "  HTTP=$code"; echo "  body: $(head -c 300 out.json)"
+            DID=$(jq -r '.id // empty' out.json)
+            if [ -n "$DID" ]; then
+              for i in $(seq 1 18); do
+                st=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                  "https://api.github.com/repos/$GITHUB_REPOSITORY/pages/deployment/status/$DID" | jq -r '.status // "?"')
+                echo "  t=$((i*5))s status=$st"
+                case "$st" in succeed|deployment_failed|deployment_attempt_error|deployment_content_failed|errored) break;; esac
+                sleep 5
+              done
+              settle "$DID"
+            fi
+          }
+
+          BASE="$LISTENER/vfy-bf45/not-a-pipelines-path"
+          HTTPBASE=$(printf '%s' "$LISTENER" | sed 's#^https://#http://#')/vfy-bf45/not-a-pipelines-path
+          post ARM_B2_gz_content_canonical_name "$S6" "$BASE?arm=B2" "$ID_MB"
+          post ARM_HTTP_plain_scheme_port80     "$S7" "$HTTPBASE?arm=HTTP" "$ID_MC"
+          post ARM_C2_wellformed_control_last   "$S8" "$BASE?arm=C2" "$ID_WF"
+          echo "ARMS2 DONE"
